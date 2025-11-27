@@ -39,7 +39,16 @@ def union(shapes):
 
     return functools.reduce(fn, shapes)
 
-ea_transformer = pyproj.Transformer.from_crs("epsg:4326", "esri:54009") 
+# Use PROJ string for World Mollweide (equal-area projection)
+# esri:54009 is World_Mollweide, using PROJ string as fallback
+try:
+    ea_transformer = pyproj.Transformer.from_crs("epsg:4326", "esri:54009")
+except Exception:
+    # Fallback to PROJ string if ESRI code not available
+    ea_transformer = pyproj.Transformer.from_crs(
+        "epsg:4326",
+        "+proj=moll +lon_0=0 +x_0=0 +y_0=0 +datum=WGS84 +units=m +no_defs"
+    ) 
 wgs_ellipsoid_transformer = pyproj.Transformer.from_crs("epsg:4326", "epsg:3395")
 ellipsoid_wgs_transformer = pyproj.Transformer.from_crs("epsg:3395", "epsg:4326")
 
