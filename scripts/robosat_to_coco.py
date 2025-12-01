@@ -20,8 +20,17 @@ import json
 import csv
 import shutil
 import subprocess
+import collections
+import numpy as np
 from pathlib import Path
 from typing import List, Dict, Tuple, Optional
+from PIL import Image
+import mercantile
+from rasterio.crs import CRS
+from rasterio.transform import from_bounds
+from rasterio.features import rasterize
+from rasterio.warp import transform
+from supermercado import burntiles
 
 # Add robosat to path
 robosat_dir = Path(__file__).parent.parent
@@ -37,11 +46,49 @@ try:
     from robosat.tools.cover import main as cover_main
     from robosat.tools.download import main as download_main
     from robosat.tools.rasterize import main as rasterize_main
+    try:
+        from robosat.tools.rasterize import feature_to_mercator, burn
+    except ImportError:
+        # feature_to_mercator might not be directly importable, we'll define it ourselves
+        feature_to_mercator = None
+        burn = None
+    from robosat.colors import make_palette, Mapbox
     ROBOSAT_AVAILABLE = True
 except ImportError:
     ROBOSAT_AVAILABLE = False
+    feature_to_mercator = None
+    burn = None
+    Mapbox = None
     print("Warning: robosat not available. Install robosat or use Docker.")
     print("Docker usage: docker run -it --rm -v $PWD:/data robosat:latest-cpu")
+    
+    # Fallback color map for make_palette
+    COLOR_MAP = {
+        "dark": (64, 64, 64),
+        "gray": (238, 238, 238),
+        "light": (248, 248, 248),
+        "white": (255, 255, 255),
+        "cyan": (59, 178, 208),
+        "blue": (56, 135, 190),
+        "bluedark": (34, 59, 83),
+        "denim": (80, 102, 127),
+        "navy": (40, 53, 61),
+        "navydark": (34, 43, 48),
+        "purple": (138, 138, 203),
+        "teal": (65, 175, 165),
+        "green": (86, 184, 129),
+        "yellow": (241, 240, 117),
+        "mustard": (251, 176, 59),
+        "orange": (249, 136, 108),
+        "red": (229, 94, 94),
+        "pink": (237, 100, 152),
+    }
+    
+    def make_palette(*colors):
+        """Fallback make_palette implementation when robosat is not available."""
+        rgbs = [COLOR_MAP.get(color, (128, 128, 128)) for color in colors]
+        flattened = sum(rgbs, ())
+        return list(flattened)
 
 try:
     from src.dataset_builder.coco_exporter import COCOExporter
@@ -60,7 +107,8 @@ class RoboSatToCOCO:
         output_dir: str,
         zoom: int = 19,
         tile_size: int = 512,
-        feature_types: List[str] = None
+        feature_types: List[str] = None,
+        test_tiles: Optional[int] = None
     ):
         """
         Initialize the converter.
@@ -70,11 +118,13 @@ class RoboSatToCOCO:
             zoom: Zoom level for tiles
             tile_size: Size of tiles in pixels
             feature_types: List of feature types to extract (building, road, parking)
+            test_tiles: Limit number of tiles for testing (optional)
         """
         self.output_dir = Path(output_dir)
         self.zoom = zoom
         self.tile_size = tile_size
         self.feature_types = feature_types or ["building"]
+        self.test_tiles = test_tiles
         
         # Create directory structure
         self.work_dir = self.output_dir / "robosat_work"
@@ -234,6 +284,12 @@ class RoboSatToCOCO:
         with open(tiles_file, 'r') as f:
             tile_count = sum(1 for _ in f)
         print(f"  ✅ Generated {tile_count} tiles")
+        
+        # Limit tiles if test_tiles is set
+        if self.test_tiles is not None and tile_count > self.test_tiles:
+            self._limit_tiles(tiles_file, self.test_tiles)
+            print(f"  🔬 Limited to {self.test_tiles} tiles for testing")
+        
         return str(tiles_file)
     
     def download_images(
@@ -300,19 +356,134 @@ class RoboSatToCOCO:
         print(f"  ✅ Downloaded images to {self.images_dir}")
         return str(self.images_dir)
     
+    def _feature_to_mercator(self, feature):
+        """Normalize feature and converts coords to 3857 (copied from robosat)."""
+        src_crs = CRS.from_epsg(4326)
+        dst_crs = CRS.from_epsg(3857)
+        
+        geometry = feature["geometry"]
+        if geometry["type"] == "Polygon":
+            xys = (zip(*part) for part in geometry["coordinates"])
+            xys = (list(zip(*transform(src_crs, dst_crs, *xy))) for xy in xys)
+            yield {"coordinates": list(xys), "type": "Polygon"}
+        elif geometry["type"] == "MultiPolygon":
+            for component in geometry["coordinates"]:
+                xys = (zip(*part) for part in component)
+                xys = (list(zip(*transform(src_crs, dst_crs, *xy))) for xy in xys)
+                yield {"coordinates": list(xys), "type": "Polygon"}
+    
+    def _rasterize_multiclass(
+        self,
+        geojson_file: str,
+        tiles_file: str,
+        dataset_config: Path
+    ):
+        """
+        Custom multi-class rasterization that assigns different pixel values to different feature types.
+        
+        Args:
+            geojson_file: Path to merged GeoJSON file with tagged features
+            tiles_file: Path to tiles CSV file
+            dataset_config: Path to dataset config file
+        """
+        from tqdm import tqdm
+        
+        # Load dataset config
+        try:
+            import toml
+            with open(dataset_config, 'r') as f:
+                dataset = toml.load(f)
+        except ImportError:
+            # Fallback: parse manually
+            dataset = {"common": {"classes": ["background"] + self.feature_types}}
+        
+        classes = dataset["common"]["classes"]
+        # Get colors from config, or generate them if missing
+        if "colors" in dataset["common"]:
+            colors = dataset["common"]["colors"]
+        else:
+            # Generate colors if missing
+            colors = ["denim"]  # background
+            for class_name in classes[1:]:  # skip background
+                colors.append(self._get_color_for_feature_type(class_name))
+        
+        # Create mapping from feature type to pixel value (class index)
+        feature_type_to_class = {ft: idx + 1 for idx, ft in enumerate(self.feature_types)}
+        # Background is class 0
+        
+        # Load GeoJSON
+        with open(geojson_file, 'r') as f:
+            fc = json.load(f)
+        
+        # Group features by type and tile
+        feature_map = collections.defaultdict(lambda: collections.defaultdict(list))
+        
+        for feature in tqdm(fc["features"], ascii=True, unit="feature"):
+            if feature["geometry"]["type"] not in ["Polygon", "MultiPolygon"]:
+                continue
+            
+            feature_type = feature.get("properties", {}).get("feature_type", self.feature_types[0])
+            if feature_type not in feature_type_to_class:
+                continue
+            
+            try:
+                for tile in burntiles.burn([feature], zoom=self.zoom):
+                    tile_obj = mercantile.Tile(*tile)
+                    feature_map[tile_obj][feature_type].append(feature)
+            except ValueError:
+                continue
+        
+        # Rasterize each tile
+        os.makedirs(self.masks_dir, exist_ok=True)
+        
+        for tile in tqdm(list(tiles_from_csv(tiles_file)), ascii=True, unit="tile"):
+            # Initialize mask with background (0)
+            mask = np.zeros(shape=(self.tile_size, self.tile_size), dtype=np.uint8)
+            
+            if tile in feature_map:
+                # Rasterize each feature type with its class value
+                for feature_type, features in feature_map[tile].items():
+                    class_value = feature_type_to_class[feature_type]
+                    
+                    # Convert features to mercator and rasterize
+                    shapes = []
+                    for feature in features:
+                        for geometry in self._feature_to_mercator(feature):
+                            shapes.append((geometry, class_value))
+                    
+                    if shapes:
+                        bounds = mercantile.xy_bounds(tile)
+                        transform = from_bounds(*bounds, self.tile_size, self.tile_size)
+                        rasterized = rasterize(shapes, out_shape=(self.tile_size, self.tile_size), transform=transform)
+                        # Use maximum to handle overlapping features (later features overwrite)
+                        mask = np.maximum(mask, rasterized.astype(np.uint8))
+            
+            # Save mask
+            out_dir = self.masks_dir / str(tile.z) / str(tile.x)
+            out_dir.mkdir(parents=True, exist_ok=True)
+            out_path = out_dir / f"{tile.y}.png"
+            
+            # Convert to PIL Image with palette
+            img = Image.fromarray(mask, mode="P")
+            palette = make_palette(*colors)
+            img.putpalette(palette)
+            img.save(out_path, optimize=True)
+    
     def rasterize_masks(
         self,
         geojson_file: str,
         tiles_file: str,
-        dataset_config: Optional[str] = None
+        dataset_config: Optional[str] = None,
+        use_multiclass: bool = True
         ) -> str:
         """
-        Rasterize GeoJSON features to masks using rs rasterize.
+        Rasterize GeoJSON features to masks with support for multiple feature types.
         
         Args:
-            geojson_file: Path to GeoJSON file
+            geojson_file: Path to GeoJSON file (merged if multiple feature types)
             tiles_file: Path to tiles CSV file
             dataset_config: Path to dataset config file (optional)
+            use_multiclass: Use custom multi-class rasterization (default: True)
             
         Returns:
             Path to masks directory
@@ -320,18 +491,26 @@ class RoboSatToCOCO:
         print(f"\n[Step 4] Rasterizing features to masks...")
         
         zoom_mask_dir = self.masks_dir / str(self.zoom)
-        if zoom_mask_dir.exists() and any(zoom_mask_dir.iterdir()):
-            # Count generated masks
+        # Check if masks actually exist (not just empty directories)
+        mask_count = 0
+        if zoom_mask_dir.exists():
             mask_count = sum(1 for _ in zoom_mask_dir.rglob("*.png"))
+        
+        if mask_count > 0:
             print(f"  ⏭️  Skipping: Masks already generated ({mask_count} masks) in {zoom_mask_dir}")
             return str(self.masks_dir)
         
-        # Create a simple dataset config if not provided
+        # Create dataset config
         if dataset_config is None:
             dataset_config = self.work_dir / "dataset.toml"
             self._create_dataset_config(dataset_config)
+        else:
+            dataset_config = Path(dataset_config)
         
+        # Use robosat rasterize (now supports multi-class after our fix)
         if ROBOSAT_AVAILABLE:
+            if len(self.feature_types) > 1:
+                print(f"  Using multi-class rasterization for {len(self.feature_types)} feature types...")
             class Args:
                 features = geojson_file
                 tiles = tiles_file
@@ -343,50 +522,128 @@ class RoboSatToCOCO:
             args = Args()
             rasterize_main(args)
         else:
-            # Fallback: use Docker
-            print("  Using Docker for mask rasterization...")
-            # Resolve geojson file to absolute path first
-            geojson_file_abs = os.path.abspath(geojson_file)
-            geojson_filename = os.path.basename(geojson_file_abs)
-            
-            cmd = [
-                "docker", "run", "-it", "--rm",
-                "-v", f"{os.path.abspath(self.geojson_dir)}:/data/geojson",
-                "-v", f"{os.path.abspath(self.tiles_dir)}:/data/tiles",
-                "-v", f"{os.path.abspath(self.masks_dir)}:/output",
-                "-v", f"{os.path.abspath(dataset_config)}:/config/dataset.toml",
-                "robosat:latest-cpu",
-                "rasterize",
-                f"/data/geojson/{geojson_filename}",
-                "/data/tiles/tiles.csv",
-                "/output",
-                "--dataset", "/config/dataset.toml",
-                "--zoom", str(self.zoom),
-                "--size", str(self.tile_size)
-            ]
-            subprocess.run(cmd, check=True)
+            # Fallback: use Docker (Docker image may have old code, so use custom rasterization)
+            if len(self.feature_types) > 1:
+                print("  Warning: Docker image may not support multi-class. Using custom rasterization...")
+                self._rasterize_multiclass(geojson_file, tiles_file, dataset_config)
+            else:
+                # Binary mode with Docker
+                print("  Using Docker for mask rasterization...")
+                geojson_file_abs = os.path.abspath(geojson_file)
+                geojson_filename = os.path.basename(geojson_file_abs)
+                
+                cmd = [
+                    "docker", "run", "-it", "--rm",
+                    "-v", f"{os.path.abspath(self.geojson_dir)}:/data/geojson",
+                    "-v", f"{os.path.abspath(self.tiles_dir)}:/data/tiles",
+                    "-v", f"{os.path.abspath(self.masks_dir)}:/output",
+                    "-v", f"{os.path.abspath(dataset_config)}:/config/dataset.toml",
+                    "robosat:latest-cpu",
+                    "rasterize",
+                    f"/data/geojson/{geojson_filename}",
+                    "/data/tiles/tiles.csv",
+                    "/output",
+                    "--dataset", "/config/dataset.toml",
+                    "--zoom", str(self.zoom),
+                    "--size", str(self.tile_size)
+                ]
+                subprocess.run(cmd, check=True)
         
         print(f"  ✅ Generated masks in {self.masks_dir}")
         return str(self.masks_dir)
     
+    def _limit_tiles(self, tiles_file: Path, limit: int):
+        """
+        Limit the number of tiles in the CSV file to the first N tiles.
+        
+        Args:
+            tiles_file: Path to tiles CSV file
+            limit: Maximum number of tiles to keep
+        """
+        # Read all lines
+        with open(tiles_file, 'r') as f:
+            lines = f.readlines()
+        
+        # Keep only the first N lines
+        if len(lines) > limit:
+            with open(tiles_file, 'w') as f:
+                f.writelines(lines[:limit])
+    
+    def _merge_geojson_files(self, geojson_files: List[str], feature_types: List[str]) -> str:
+        """
+        Merge multiple GeoJSON files into one, tagging each feature with its type.
+        
+        Args:
+            geojson_files: List of paths to GeoJSON files
+            feature_types: List of feature types corresponding to each GeoJSON file
+            
+        Returns:
+            Path to merged GeoJSON file
+        """
+        merged_features = []
+        
+        for geojson_file, feature_type in zip(geojson_files, feature_types):
+            with open(geojson_file, 'r') as f:
+                geojson_data = json.load(f)
+            
+            for feature in geojson_data.get("features", []):
+                # Tag feature with its type in properties
+                if "properties" not in feature:
+                    feature["properties"] = {}
+                feature["properties"]["feature_type"] = feature_type
+                merged_features.append(feature)
+        
+        merged_geojson = {
+            "type": "FeatureCollection",
+            "features": merged_features
+        }
+        
+        merged_file = self.geojson_dir / "merged_features.geojson"
+        with open(merged_file, 'w') as f:
+            json.dump(merged_geojson, f)
+        
+        print(f"  ✅ Merged {len(merged_features)} features from {len(geojson_files)} files")
+        return str(merged_file)
+    
+    def _get_color_for_feature_type(self, feature_type: str) -> str:
+        """Get a color name for a feature type."""
+        color_map = {
+            "building": "orange",
+            "road": "cyan",
+            "parking": "yellow",
+            "water": "blue",
+            "forest": "green"
+        }
+        return color_map.get(feature_type, "red")
+    
     def _create_dataset_config(self, config_path: Path):
-        """Create a simple dataset config for robosat."""
+        """Create a dataset config with multiple classes for different feature types."""
+        # Build classes and colors list
+        classes = ["background"]
+        colors = ["denim"]
+        
+        for feature_type in self.feature_types:
+            classes.append(feature_type)
+            colors.append(self._get_color_for_feature_type(feature_type))
+        
         try:
             import toml
             config = {
                 "common": {
-                    "classes": ["background", "foreground"],
-                    "colors": ["denim", "orange"]
+                    "classes": classes,
+                    "colors": colors
                 }
             }
             with open(config_path, 'w') as f:
                 toml.dump(config, f)
         except ImportError:
             # Fallback: write TOML manually
+            classes_str = "[" + ", ".join(f'"{c}"' for c in classes) + "]"
+            colors_str = "[" + ", ".join(f'"{c}"' for c in colors) + "]"
             with open(config_path, 'w') as f:
-                f.write("""[common]
-classes = ["background", "foreground"]
-colors = ["denim", "orange"]
+                f.write(f"""[common]
+classes = {classes_str}
+colors = {colors_str}
 """)
     
     def convert_to_coco(
@@ -535,6 +792,8 @@ colors = ["denim", "orange"]
         print(f"Work directory: {self.work_dir}")
         print(f"Feature types: {', '.join(self.feature_types)}")
         print(f"Zoom level: {self.zoom}")
+        if self.test_tiles is not None:
+            print(f"Test mode: Limited to {self.test_tiles} tiles")
         print()
         
         # Track what was processed vs skipped
@@ -555,9 +814,19 @@ colors = ["denim", "orange"]
             else:
                 processed_steps.append(f"Extract {feature_type}")
         
-        # Step 2: Generate tiles (use first geojson for now)
+        # Merge GeoJSON files if multiple feature types
+        if len(geojson_files) > 1:
+            print(f"\n[Merge] Merging {len(geojson_files)} GeoJSON files...")
+            merged_geojson = self._merge_geojson_files(geojson_files, self.feature_types)
+            geojson_for_tiles = merged_geojson
+            geojson_for_rasterize = merged_geojson
+        else:
+            geojson_for_tiles = geojson_files[0]
+            geojson_for_rasterize = geojson_files[0]
+        
+        # Step 2: Generate tiles (use merged geojson to cover all features)
         tiles_file_before = self.tiles_dir / "tiles.csv"
-        tiles_file = self.generate_tiles(geojson_files[0])
+        tiles_file = self.generate_tiles(geojson_for_tiles)
         if tiles_file_before.exists() and tiles_file_before.stat().st_size > 0:
             skipped_steps.append("Generate tiles")
         else:
@@ -575,13 +844,12 @@ colors = ["denim", "orange"]
         else:
             skipped_steps.append("Download images (skipped by flag)")
         
-        # Step 4: Rasterize masks
+        # Step 4: Rasterize masks (with multi-class support)
         if not skip_rasterize:
             zoom_mask_dir_before = self.masks_dir / str(self.zoom)
             had_masks = zoom_mask_dir_before.exists() and any(zoom_mask_dir_before.iterdir())
-            # For now, rasterize first feature type
-            # TODO: Support multiple feature types
-            self.rasterize_masks(geojson_files[0], tiles_file)
+            # Use merged geojson for multi-class rasterization
+            self.rasterize_masks(geojson_for_rasterize, tiles_file, use_multiclass=len(self.feature_types) > 1)
             if had_masks:
                 skipped_steps.append("Rasterize masks")
             else:
@@ -643,11 +911,20 @@ def main():
     )
     parser.add_argument(
         "--feature-types",
+        dest="feature_types",
         type=str,
         nargs="+",
         default=["building"],
         choices=["building", "road", "parking"],
-        help="Feature types to extract (default: building)"
+        help="Feature types to extract (default: building). Can use --feature-types or --feature_types"
+    )
+    parser.add_argument(
+        "--feature_types",
+        dest="feature_types",
+        type=str,
+        nargs="+",
+        choices=["building", "road", "parking"],
+        help=argparse.SUPPRESS  # Hide from help since it's an alias
     )
     parser.add_argument(
         "--mapbox-token",
@@ -677,6 +954,12 @@ def main():
         action="store_false",
         help="Don't split into train/val/test"
     )
+    parser.add_argument(
+        "--test-tiles",
+        type=int,
+        default=None,
+        help="Limit number of tiles for quick testing (e.g., --test-tiles 20)"
+    )
     
     args = parser.parse_args()
     
@@ -684,7 +967,8 @@ def main():
         output_dir=args.output,
         zoom=args.zoom,
         tile_size=args.tile_size,
-        feature_types=args.feature_types
+        feature_types=args.feature_types,
+        test_tiles=args.test_tiles
     )
     
     converter.run_full_pipeline(

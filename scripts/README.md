@@ -16,7 +16,7 @@ export MAPBOX_API_KEY="your_token_here"  # Linux/Mac
 python scripts/robosat_to_coco.py --osm-file data/Essex/essex-latest.osm.pbf --output ./data/coco_dataset --zoom 19
 
 # Option 2: Pass token directly
-python scripts/robosat_to_coco.py --osm-file data/Essex/essex-latest.osm.pbf --output ./data/coco_dataset --zoom 19 --mapbox-token "your_token_here"
+python scripts/robosat_to_coco.py --osm-file data/Essex/england.osm.pbf --output ./data/coco_dataset/england --zoom 18 --test-tiles 20 --feature-types building road parking --mapbox-token pk.eyJ1IjoiZXZlbnR1bWFpIiwiYSI6ImNtaTZ6ZnBnZDAzeXEyaXB5a3FkamFveG0ifQ.VGWd4ptbCI_DyBTMWU6R1A
 
 ```
 

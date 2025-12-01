@@ -61,21 +61,30 @@ def feature_to_mercator(feature):
             yield {"coordinates": list(xys), "type": "Polygon"}
 
 
-def burn(tile, features, size):
+def burn(tile, features, size, feature_type_to_class=None):
     """Burn tile with features.
 
     Args:
       tile: the mercantile tile to burn.
       features: the geojson features to burn.
       size: the size of burned image.
+      feature_type_to_class: Optional dict mapping feature_type to class value.
 
     Returns:
       image: rasterized file of size with features burned.
     """
 
-    # the value you want in the output raster where a shape exists
-    burnval = 1
-    shapes = ((geometry, burnval) for feature in features for geometry in feature_to_mercator(feature))
+    shapes = []
+    for feature in features:
+        # Get burn value based on feature type if provided, otherwise use 1
+        if feature_type_to_class:
+            feature_type = feature.get("properties", {}).get("feature_type", None)
+            burnval = feature_type_to_class.get(feature_type, 1)
+        else:
+            burnval = 1
+        
+        for geometry in feature_to_mercator(feature):
+            shapes.append((geometry, burnval))
 
     bounds = mercantile.xy_bounds(tile)
     transform = from_bounds(*bounds, size, size)
@@ -90,9 +99,17 @@ def main(args):
     colors = dataset["common"]["colors"]
     assert len(classes) == len(colors), "classes and colors coincide"
 
-    assert len(colors) == 2, "only binary models supported right now"
-    bg = colors[0]
-    fg = colors[1]
+    # Support multi-class: create mapping from feature_type to class index
+    # Background is class 0, other classes start from 1
+    feature_type_to_class = {}
+    if len(classes) > 2:
+        # Multi-class mode: map feature types to class indices
+        for idx, class_name in enumerate(classes):
+            if class_name != "background":
+                feature_type_to_class[class_name] = idx
+    else:
+        # Binary mode (backward compatible)
+        feature_type_to_class = None
 
     os.makedirs(args.out, exist_ok=True)
 
@@ -106,7 +123,8 @@ def main(args):
     feature_map = collections.defaultdict(list)
     for i, feature in enumerate(tqdm(fc["features"], ascii=True, unit="feature")):
 
-        if feature["geometry"]["type"] != "Polygon":
+        # Support both Polygon and MultiPolygon
+        if feature["geometry"]["type"] not in ["Polygon", "MultiPolygon"]:
             continue
 
         try:
@@ -119,7 +137,7 @@ def main(args):
     # Burn features to tiles and write to a slippy map directory.
     for tile in tqdm(list(tiles_from_csv(args.tiles)), ascii=True, unit="tile"):
         if tile in feature_map:
-            out = burn(tile, feature_map[tile], args.size)
+            out = burn(tile, feature_map[tile], args.size, feature_type_to_class)
         else:
             out = np.zeros(shape=(args.size, args.size), dtype=np.uint8)
 
@@ -130,11 +148,13 @@ def main(args):
 
         if os.path.exists(out_path):
             prev = np.array(Image.open(out_path))
-            out = np.maximum(out, prev)
+            # For multi-class, use maximum to handle overlapping features
+            out = np.maximum(out, prev.astype(np.uint8))
 
         out = Image.fromarray(out, mode="P")
 
-        palette = make_palette(bg, fg)
+        # Support multi-class palette
+        palette = make_palette(*colors)
         out.putpalette(palette)
 
         out.save(out_path, optimize=True)
