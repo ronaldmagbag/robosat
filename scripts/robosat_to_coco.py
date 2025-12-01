@@ -123,7 +123,13 @@ class RoboSatToCOCO:
         self.output_dir = Path(output_dir)
         self.zoom = zoom
         self.tile_size = tile_size
-        self.feature_types = feature_types or ["building"]
+        # Handle "all" feature type
+        if feature_types and "all" in feature_types:
+            self.feature_types = ["building", "road", "parking"]
+            self._use_all_handler = True
+        else:
+            self.feature_types = feature_types or ["building"]
+            self._use_all_handler = False
         self.test_tiles = test_tiles
         
         # Create directory structure
@@ -140,32 +146,17 @@ class RoboSatToCOCO:
         for d in [self.geojson_dir, self.tiles_dir, self.images_dir, self.masks_dir]:
             d.mkdir(parents=True, exist_ok=True)
     
-    def extract_features(self, osm_file: str, feature_type: str) -> str:
-        """
-        Extract GeoJSON features from OSM file using rs extract.
-        
-        Args:
-            osm_file: Path to .osm.pbf file
-            feature_type: Type of feature (building, road, parking)
-            
-        Returns:
-            Path to output GeoJSON file
-        """
-        print(f"\n[Step 1] Extracting {feature_type} features from OSM...")
-        
-        # Resolve and check OSM file exists
+    def _validate_osm_file(self, osm_file: str) -> str:
+        """Validate OSM file exists and return absolute path."""
         osm_file_abs = os.path.abspath(osm_file)
         if not os.path.exists(osm_file_abs):
-            # Try to suggest alternative paths
             suggestions = []
             current_dir = Path.cwd()
-            # Check common locations
-            common_paths = [
+            for alt_path in [
                 current_dir / "data" / "Essex" / "essex-latest.osm.pbf",
                 current_dir / "data" / "essex-latest.osm.pbf",
                 current_dir.parent / "data" / "essex-latest.osm.pbf",
-            ]
-            for alt_path in common_paths:
+            ]:
                 if alt_path.exists():
                     suggestions.append(str(alt_path.relative_to(current_dir)))
             
@@ -175,73 +166,80 @@ class RoboSatToCOCO:
             else:
                 error_msg += f"\n\nTo download a test file, run:\n  wget https://download.geofabrik.de/europe/united-kingdom/england/essex-latest.osm.pbf -O data/essex-latest.osm.pbf"
             raise FileNotFoundError(error_msg)
+        return osm_file_abs
+    
+    def extract_features_multi(self, osm_file: str, feature_types: List[str]) -> str:
+        """Extract multiple feature types from OSM in a single pass."""
+        if self._use_all_handler:
+            print(f"\n[Step 1] Extracting all features (building, road, parking) from OSM...")
+        else:
+            print(f"\n[Step 1] Extracting {', '.join(feature_types)} features from OSM...")
         
-        geojson_file = self.geojson_dir / f"{feature_type}.geojson"
+        osm_file_abs = self._validate_osm_file(osm_file)
+        geojson_file = self.geojson_dir / "merged_features.geojson"
         
-        # Check if any geojson files already exist (robosat creates files with UUIDs)
-        existing_files = list(self.geojson_dir.glob(f"{feature_type}-*.geojson"))
-        if existing_files:
-            # Use the most recently created file
-            geojson_file = max(existing_files, key=lambda p: p.stat().st_mtime)
-            file_size = geojson_file.stat().st_size
-            print(f"  ⏭️  Skipping: GeoJSON file already exists ({file_size:,} bytes): {geojson_file.name}")
+        # Check if output file already exists
+        if geojson_file.exists():
+            print(f"  ⏭️  Skipping: GeoJSON file already exists ({geojson_file.stat().st_size:,} bytes)")
             return str(geojson_file)
         
-        # Use robosat extract tool
+        # Check for existing batch files (use first one if exists)
+        batch_files = list(self.geojson_dir.glob("merged_features-*.geojson"))
+        if batch_files:
+            print(f"  ⏭️  Skipping: Found {len(batch_files)} batch file(s), using first one")
+            return str(batch_files[0])
+        
+        # Extract using AllFeaturesHandler or Docker fallback
         if ROBOSAT_AVAILABLE:
-            # Create argparse namespace for extract tool
             class Args:
-                type = feature_type
+                # Use "all" if we're extracting all types, otherwise use the list
+                types = ["all"] if self._use_all_handler else feature_types
                 batch = 100000
-                map = osm_file_abs  # Use resolved absolute path
+                map = osm_file_abs
                 out = str(geojson_file)
-            
-            args = Args()
-            extract_main(args)
+            extract_main(Args())
         else:
-            # Fallback: use Docker
-            print("  Using Docker for extraction...")
-            # OSM file already resolved above
+            # Docker fallback: use AllFeaturesHandler to extract all types in one pass
+            print("  Using Docker for extraction (multi-type, single pass)...")
             osm_dir = os.path.dirname(osm_file_abs)
             osm_filename = os.path.basename(osm_file_abs)
             
+            # Build Docker command
             cmd = [
                 "docker", "run", "-it", "--rm",
                 "-v", f"{osm_dir}:/data",
                 "-v", f"{os.path.abspath(self.geojson_dir)}:/output",
                 "robosat:latest-cpu",
                 "extract",
-                "--type", feature_type,
                 f"/data/{osm_filename}",
-                f"/output/{feature_type}.geojson"
+                f"/output/merged_features.geojson"
             ]
+            # Use "all" if extracting all types, otherwise add --type for each
+            if self._use_all_handler:
+                cmd.extend(["--type", "all"])
+            else:
+                for feature_type in feature_types:
+                    cmd.extend(["--type", feature_type])
+            
             subprocess.run(cmd, check=True)
         
-        # RoboSat creates files with UUIDs, so find the actual file(s) created
-        created_files = list(self.geojson_dir.glob(f"{feature_type}-*.geojson"))
-        if created_files:
-            # Use the most recently created file
-            geojson_file = max(created_files, key=lambda p: p.stat().st_mtime)
-            print(f"  ✅ Extracted features to {geojson_file}")
+        # Check for batch files created by FeatureStorage (use first one)
+        batch_files = list(self.geojson_dir.glob("merged_features-*.geojson"))
+        if batch_files:
+            print(f"  ✅ Extracted features to {len(batch_files)} batch file(s)")
+            return str(batch_files[0])
+        
+        if geojson_file.exists():
             return str(geojson_file)
-        else:
-            # Fallback: check if the exact filename exists
-            if geojson_file.exists():
-                print(f"  ✅ Extracted features to {geojson_file}")
-                return str(geojson_file)
-            else:
-                raise FileNotFoundError(f"GeoJSON file not found after extraction. Expected in {self.geojson_dir}")
+        
+        raise FileNotFoundError(f"GeoJSON file not found after extraction: {self.geojson_dir}")
+    
+    def extract_features(self, osm_file: str, feature_type: str) -> str:
+        """Extract single feature type from OSM (uses extract_features_multi internally)."""
+        return self.extract_features_multi(osm_file, [feature_type])
     
     def generate_tiles(self, geojson_file: str) -> str:
-        """
-        Generate tiles covering GeoJSON features using rs cover.
-        
-        Args:
-            geojson_file: Path to GeoJSON file
-            
-        Returns:
-            Path to tiles CSV file
-        """
+        """Generate tiles covering GeoJSON features."""
         print(f"\n[Step 2] Generating tiles covering features...")
         
         tiles_file = self.tiles_dir / "tiles.csv"
@@ -292,23 +290,8 @@ class RoboSatToCOCO:
         
         return str(tiles_file)
     
-    def download_images(
-        self,
-        tiles_file: str,
-        mapbox_token: Optional[str] = None,
-        url_template: Optional[str] = None
-        ) -> str:
-        """
-        Download satellite images using rs download.
-        
-        Args:
-            tiles_file: Path to tiles CSV file
-            mapbox_token: Mapbox API token (optional)
-            url_template: Custom URL template (optional)
-            
-        Returns:
-            Path to images directory
-        """
+    def download_images(self, tiles_file: str, mapbox_token: Optional[str] = None, url_template: Optional[str] = None) -> str:
+        """Download satellite images for tiles."""
         print(f"\n[Step 3] Downloading satellite images...")
         
         zoom_dir = self.images_dir / str(self.zoom)
@@ -372,20 +355,8 @@ class RoboSatToCOCO:
                 xys = (list(zip(*transform(src_crs, dst_crs, *xy))) for xy in xys)
                 yield {"coordinates": list(xys), "type": "Polygon"}
     
-    def _rasterize_multiclass(
-        self,
-        geojson_file: str,
-        tiles_file: str,
-        dataset_config: Path
-    ):
-        """
-        Custom multi-class rasterization that assigns different pixel values to different feature types.
-        
-        Args:
-            geojson_file: Path to merged GeoJSON file with tagged features
-            tiles_file: Path to tiles CSV file
-            dataset_config: Path to dataset config file
-        """
+    def _rasterize_multiclass(self, geojson_file: str, tiles_file: str, dataset_config: Path):
+        """Custom multi-class rasterization with different pixel values per feature type."""
         from tqdm import tqdm
         
         # Load dataset config
@@ -422,7 +393,16 @@ class RoboSatToCOCO:
             if feature["geometry"]["type"] not in ["Polygon", "MultiPolygon"]:
                 continue
             
-            feature_type = feature.get("properties", {}).get("feature_type", self.feature_types[0])
+            props = feature.get("properties", {})
+            # Support feature_types array (use first type) or fallback to feature_type
+            feature_types = props.get("feature_types", None)
+            if feature_types and isinstance(feature_types, list) and len(feature_types) > 0:
+                # Use first type for rasterization (can be extended to support all types)
+                feature_type = feature_types[0]
+            else:
+                # Fallback to singular feature_type for backward compatibility
+                feature_type = props.get("feature_type", self.feature_types[0])
+            
             if feature_type not in feature_type_to_class:
                 continue
             
@@ -469,25 +449,8 @@ class RoboSatToCOCO:
             img.putpalette(palette)
             img.save(out_path, optimize=True)
     
-    def rasterize_masks(
-        self,
-        geojson_file: str,
-        tiles_file: str,
-        dataset_config: Optional[str] = None,
-        use_multiclass: bool = True
-        ) -> str:
-        """
-        Rasterize GeoJSON features to masks with support for multiple feature types.
-        
-        Args:
-            geojson_file: Path to GeoJSON file (merged if multiple feature types)
-            tiles_file: Path to tiles CSV file
-            dataset_config: Path to dataset config file (optional)
-            use_multiclass: Use custom multi-class rasterization (default: True)
-            
-        Returns:
-            Path to masks directory
-        """
+    def rasterize_masks(self, geojson_file: str, tiles_file: str, dataset_config: Optional[str] = None, use_multiclass: bool = True) -> str:
+        """Rasterize GeoJSON features to masks with multi-class support."""
         print(f"\n[Step 4] Rasterizing features to masks...")
         
         zoom_mask_dir = self.masks_dir / str(self.zoom)
@@ -553,57 +516,12 @@ class RoboSatToCOCO:
         return str(self.masks_dir)
     
     def _limit_tiles(self, tiles_file: Path, limit: int):
-        """
-        Limit the number of tiles in the CSV file to the first N tiles.
-        
-        Args:
-            tiles_file: Path to tiles CSV file
-            limit: Maximum number of tiles to keep
-        """
-        # Read all lines
+        """Limit tiles CSV to first N tiles."""
         with open(tiles_file, 'r') as f:
             lines = f.readlines()
-        
-        # Keep only the first N lines
         if len(lines) > limit:
             with open(tiles_file, 'w') as f:
                 f.writelines(lines[:limit])
-    
-    def _merge_geojson_files(self, geojson_files: List[str], feature_types: List[str]) -> str:
-        """
-        Merge multiple GeoJSON files into one, tagging each feature with its type.
-        
-        Args:
-            geojson_files: List of paths to GeoJSON files
-            feature_types: List of feature types corresponding to each GeoJSON file
-            
-        Returns:
-            Path to merged GeoJSON file
-        """
-        merged_features = []
-        
-        for geojson_file, feature_type in zip(geojson_files, feature_types):
-            with open(geojson_file, 'r') as f:
-                geojson_data = json.load(f)
-            
-            for feature in geojson_data.get("features", []):
-                # Tag feature with its type in properties
-                if "properties" not in feature:
-                    feature["properties"] = {}
-                feature["properties"]["feature_type"] = feature_type
-                merged_features.append(feature)
-        
-        merged_geojson = {
-            "type": "FeatureCollection",
-            "features": merged_features
-        }
-        
-        merged_file = self.geojson_dir / "merged_features.geojson"
-        with open(merged_file, 'w') as f:
-            json.dump(merged_geojson, f)
-        
-        print(f"  ✅ Merged {len(merged_features)} features from {len(geojson_files)} files")
-        return str(merged_file)
     
     def _get_color_for_feature_type(self, feature_type: str) -> str:
         """Get a color name for a feature type."""
@@ -617,8 +535,7 @@ class RoboSatToCOCO:
         return color_map.get(feature_type, "red")
     
     def _create_dataset_config(self, config_path: Path):
-        """Create a dataset config with multiple classes for different feature types."""
-        # Build classes and colors list
+        """Create dataset config with classes and colors for feature types."""
         classes = ["background"]
         colors = ["denim"]
         
@@ -646,26 +563,8 @@ classes = {classes_str}
 colors = {colors_str}
 """)
     
-    def convert_to_coco(
-        self,
-        images_dir: str,
-        masks_dir: str,
-        split: bool = True,
-        train_ratio: float = 0.7,
-        val_ratio: float = 0.2,
-        test_ratio: float = 0.1
-    ):
-        """
-        Convert slippy map format to COCO format.
-        
-        Args:
-            images_dir: Directory with images in slippy map format (z/x/y.png)
-            masks_dir: Directory with masks in slippy map format (z/x/y.png)
-            split: Whether to split into train/val/test
-            train_ratio: Training set ratio
-            val_ratio: Validation set ratio
-            test_ratio: Test set ratio
-        """
+    def convert_to_coco(self, images_dir: str, masks_dir: str, split: bool = True, train_ratio: float = 0.7, val_ratio: float = 0.2, test_ratio: float = 0.1):
+        """Convert slippy map format to COCO format."""
         if not COCO_EXPORTER_AVAILABLE:
             print("Error: COCO exporter not available. Cannot convert to COCO format.")
             print("Please ensure geoseg project is available.")
@@ -767,24 +666,8 @@ colors = {colors_str}
         
         print(f"  ✅ COCO dataset created in {self.coco_dir}")
     
-    def run_full_pipeline(
-        self,
-        osm_file: str,
-        mapbox_token: Optional[str] = None,
-        url_template: Optional[str] = None,
-        skip_download: bool = False,
-        skip_rasterize: bool = False
-    ):
-        """
-        Run the full pipeline from OSM to COCO.
-        
-        Args:
-            osm_file: Path to .osm.pbf file
-            mapbox_token: Mapbox API token (optional)
-            url_template: Custom URL template (optional)
-            skip_download: Skip image download step
-            skip_rasterize: Skip mask rasterization step
-        """
+    def run_full_pipeline(self, osm_file: str, mapbox_token: Optional[str] = None, url_template: Optional[str] = None, skip_download: bool = False, skip_rasterize: bool = False):
+        """Run full pipeline from OSM to COCO."""
         print("=" * 60)
         print("RoboSat to COCO Dataset Preparation")
         print("=" * 60)
@@ -801,28 +684,29 @@ colors = {colors_str}
         skipped_steps = []
         
         # Step 1: Extract features
-        geojson_files = []
-        for feature_type in self.feature_types:
-            # Check if file already exists before extraction
+        if len(self.feature_types) > 1:
+            # Use multi-type extraction (more efficient - single pass)
+            existing_before = list(self.geojson_dir.glob("merged_features-*.geojson"))
+            merged_geojson = self.extract_features_multi(osm_file, self.feature_types)
+            existing_after = list(self.geojson_dir.glob("merged_features-*.geojson"))
+            if existing_before and len(existing_after) == len(existing_before):
+                skipped_steps.append(f"Extract {', '.join(self.feature_types)} (multi-type)")
+            else:
+                processed_steps.append(f"Extract {', '.join(self.feature_types)} (multi-type)")
+            geojson_for_tiles = merged_geojson
+            geojson_for_rasterize = merged_geojson
+        else:
+            # Single type extraction
+            feature_type = self.feature_types[0]
             existing_before = list(self.geojson_dir.glob(f"{feature_type}-*.geojson"))
             geojson_file = self.extract_features(osm_file, feature_type)
-            geojson_files.append(geojson_file)
-            # Check if it was skipped (file existed before)
             existing_after = list(self.geojson_dir.glob(f"{feature_type}-*.geojson"))
             if existing_before and len(existing_after) == len(existing_before):
                 skipped_steps.append(f"Extract {feature_type}")
             else:
                 processed_steps.append(f"Extract {feature_type}")
-        
-        # Merge GeoJSON files if multiple feature types
-        if len(geojson_files) > 1:
-            print(f"\n[Merge] Merging {len(geojson_files)} GeoJSON files...")
-            merged_geojson = self._merge_geojson_files(geojson_files, self.feature_types)
-            geojson_for_tiles = merged_geojson
-            geojson_for_rasterize = merged_geojson
-        else:
-            geojson_for_tiles = geojson_files[0]
-            geojson_for_rasterize = geojson_files[0]
+            geojson_for_tiles = geojson_file
+            geojson_for_rasterize = geojson_file
         
         # Step 2: Generate tiles (use merged geojson to cover all features)
         tiles_file_before = self.tiles_dir / "tiles.csv"
@@ -915,15 +799,15 @@ def main():
         type=str,
         nargs="+",
         default=["building"],
-        choices=["building", "road", "parking"],
-        help="Feature types to extract (default: building). Can use --feature-types or --feature_types"
+        choices=["building", "road", "parking", "all"],
+        help="Feature types to extract (default: building). Use 'all' to extract all types. Can use --feature-types or --feature_types"
     )
     parser.add_argument(
         "--feature_types",
         dest="feature_types",
         type=str,
         nargs="+",
-        choices=["building", "road", "parking"],
+        choices=["building", "road", "parking", "all"],
         help=argparse.SUPPRESS  # Hide from help since it's an alias
     )
     parser.add_argument(

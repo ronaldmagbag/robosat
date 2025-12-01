@@ -78,7 +78,13 @@ def burn(tile, features, size, feature_type_to_class=None):
     for feature in features:
         # Get burn value based on feature type if provided, otherwise use 1
         if feature_type_to_class:
-            feature_type = feature.get("properties", {}).get("feature_type", None)
+            props = feature.get("properties", {})
+            # Support feature_types array (use first type) or fallback to feature_type
+            feature_types = props.get("feature_types", None)
+            if feature_types and isinstance(feature_types, list) and len(feature_types) > 0:
+                feature_type = feature_types[0]  # Use first type for rasterization
+            else:
+                feature_type = props.get("feature_type", None)
             burnval = feature_type_to_class.get(feature_type, 1)
         else:
             burnval = 1
